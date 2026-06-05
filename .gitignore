@@ -18,3 +18,7 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Large model files (only keep .onnx and tokenizer.json)
+checkpoints/*.pkl
+checkpoints/*.tflite

@@ -1,9 +1,10 @@
 import os
-import pickle
+import json
 import time
 
 import numpy as np
 import pandas as pd
+import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -24,50 +25,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-interpreter = None
+session = None
+input_name = None
+word_index = None
+num_words = None
+
+
+class SimpleTokenizer:
+    def __init__(self, word_index, num_words):
+        self.word_index = word_index
+        self.num_words = num_words
+
+    def texts_to_sequences(self, texts):
+        sequences = []
+        for text in texts:
+            words = text.lower().split()
+            seq = []
+            for word in words:
+                idx = self.word_index.get(word)
+                if idx and (self.num_words is None or idx < self.num_words):
+                    seq.append(idx)
+            sequences.append(seq)
+        return sequences
+
+
 tokenizer = None
 
 
-def pad_sequences_manual(sequences, maxlen, padding="post", truncating="post"):
+def pad_sequences(sequences, maxlen, padding="post", truncating="post"):
     result = []
     for seq in sequences:
         if len(seq) > maxlen:
-            if truncating == "post":
-                seq = seq[:maxlen]
-            else:
-                seq = seq[-maxlen:]
+            seq = seq[:maxlen] if truncating == "post" else seq[-maxlen:]
         elif len(seq) < maxlen:
             pad_len = maxlen - len(seq)
-            if padding == "post":
-                seq = seq + [0] * pad_len
-            else:
-                seq = [0] * pad_len + seq
+            seq = seq + [0] * pad_len if padding == "post" else [0] * pad_len + seq
         result.append(seq)
     return np.array(result, dtype=np.float32)
 
 
 def load_model():
-    global interpreter, tokenizer
+    global session, input_name, tokenizer
 
-    tflite_path = os.path.join(CHECKPOINT_DIR, "fake_news_model.tflite")
-    tokenizer_path = os.path.join(CHECKPOINT_DIR, "tokenizer.pkl")
+    onnx_path = os.path.join(CHECKPOINT_DIR, "fake_news_model.onnx")
+    tokenizer_path = os.path.join(CHECKPOINT_DIR, "tokenizer.json")
 
-    if not os.path.exists(tokenizer_path):
-        from tokenizer_setup import build_tokenizer
-        tokenizer = build_tokenizer()
-    else:
-        with open(tokenizer_path, "rb") as f:
-            tokenizer = pickle.load(f)
+    with open(tokenizer_path, "r") as f:
+        tok_data = json.load(f)
+    tokenizer = SimpleTokenizer(tok_data["word_index"], tok_data["num_words"])
 
-    try:
-        import tflite_runtime.interpreter as tflite
-        interpreter = tflite.Interpreter(model_path=tflite_path)
-    except ImportError:
-        import tensorflow as tf
-        interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
 
-    interpreter.allocate_tensors()
-    print("TFLite model and tokenizer loaded successfully.")
+    print("ONNX model and tokenizer loaded successfully.")
 
 
 @app.on_event("startup")
@@ -110,23 +120,16 @@ class DatasetStatsResponse(BaseModel):
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    if interpreter is None or tokenizer is None:
+    if session is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     start_time = time.time()
 
     sequences = tokenizer.texts_to_sequences([request.text])
-    padded = pad_sequences_manual(sequences, maxlen=MAX_LEN, padding="post", truncating="post")
+    padded = pad_sequences(sequences, maxlen=MAX_LEN, padding="post", truncating="post")
 
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    interpreter.resize_tensor_input(input_details[0]["index"], padded.shape)
-    interpreter.allocate_tensors()
-    interpreter.set_tensor(input_details[0]["index"], padded)
-    interpreter.invoke()
-
-    prediction = interpreter.get_tensor(output_details[0]["index"])[0][0]
+    result = session.run(None, {input_name: padded})
+    prediction = result[0][0][0]
 
     inference_time = (time.time() - start_time) * 1000
 
@@ -148,7 +151,7 @@ async def predict(request: PredictionRequest):
 
 @app.get("/model-info", response_model=ModelInfoResponse)
 async def model_info():
-    if interpreter is None:
+    if session is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     layers = [
@@ -193,6 +196,6 @@ async def dataset_stats():
 async def health():
     return {
         "status": "healthy",
-        "model_loaded": interpreter is not None,
+        "model_loaded": session is not None,
         "tokenizer_loaded": tokenizer is not None,
     }
