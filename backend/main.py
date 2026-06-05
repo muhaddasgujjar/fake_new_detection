@@ -8,12 +8,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-import tensorflow as tf
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "..", "checkpoints")
 DATASET_DIR = os.path.join(BASE_DIR, "..", "dataset")
@@ -30,14 +24,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = None
+interpreter = None
 tokenizer = None
 
 
-def load_model():
-    global model, tokenizer
+def pad_sequences_manual(sequences, maxlen, padding="post", truncating="post"):
+    result = []
+    for seq in sequences:
+        if len(seq) > maxlen:
+            if truncating == "post":
+                seq = seq[:maxlen]
+            else:
+                seq = seq[-maxlen:]
+        elif len(seq) < maxlen:
+            pad_len = maxlen - len(seq)
+            if padding == "post":
+                seq = seq + [0] * pad_len
+            else:
+                seq = [0] * pad_len + seq
+        result.append(seq)
+    return np.array(result, dtype=np.float32)
 
-    model_path = os.path.join(CHECKPOINT_DIR, "fake_news_model.pkl")
+
+def load_model():
+    global interpreter, tokenizer
+
+    tflite_path = os.path.join(CHECKPOINT_DIR, "fake_news_model.tflite")
     tokenizer_path = os.path.join(CHECKPOINT_DIR, "tokenizer.pkl")
 
     if not os.path.exists(tokenizer_path):
@@ -47,10 +59,15 @@ def load_model():
         with open(tokenizer_path, "rb") as f:
             tokenizer = pickle.load(f)
 
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
+    try:
+        import tflite_runtime.interpreter as tflite
+        interpreter = tflite.Interpreter(model_path=tflite_path)
+    except ImportError:
+        import tensorflow as tf
+        interpreter = tf.lite.Interpreter(model_path=tflite_path)
 
-    print("Model and tokenizer loaded successfully.")
+    interpreter.allocate_tensors()
+    print("TFLite model and tokenizer loaded successfully.")
 
 
 @app.on_event("startup")
@@ -93,15 +110,23 @@ class DatasetStatsResponse(BaseModel):
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    if model is None or tokenizer is None:
+    if interpreter is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     start_time = time.time()
 
     sequences = tokenizer.texts_to_sequences([request.text])
-    padded = pad_sequences(sequences, maxlen=MAX_LEN, padding="post", truncating="post")
+    padded = pad_sequences_manual(sequences, maxlen=MAX_LEN, padding="post", truncating="post")
 
-    prediction = model.predict(padded, verbose=0)[0][0]
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    interpreter.resize_tensor_input(input_details[0]["index"], padded.shape)
+    interpreter.allocate_tensors()
+    interpreter.set_tensor(input_details[0]["index"], padded)
+    interpreter.invoke()
+
+    prediction = interpreter.get_tensor(output_details[0]["index"])[0][0]
 
     inference_time = (time.time() - start_time) * 1000
 
@@ -123,24 +148,23 @@ async def predict(request: PredictionRequest):
 
 @app.get("/model-info", response_model=ModelInfoResponse)
 async def model_info():
-    if model is None:
+    if interpreter is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    layers = []
-    for layer in model.layers:
-        layers.append({
-            "name": layer.name,
-            "type": layer.__class__.__name__,
-            "output_shape": str(layer.output_shape) if hasattr(layer, "output_shape") else "N/A",
-            "params": layer.count_params(),
-        })
+    layers = [
+        {"name": "embedding", "type": "Embedding", "output_shape": "(None, 300, 128)", "params": 6400000},
+        {"name": "bidirectional", "type": "Bidirectional LSTM", "output_shape": "(None, 300, 128)", "params": 98816},
+        {"name": "dropout", "type": "Dropout", "output_shape": "(None, 300, 128)", "params": 0},
+        {"name": "lstm_1", "type": "LSTM", "output_shape": "(None, 32)", "params": 20608},
+        {"name": "dense", "type": "Dense", "output_shape": "(None, 64)", "params": 2112},
+        {"name": "dropout_1", "type": "Dropout", "output_shape": "(None, 64)", "params": 0},
+        {"name": "dense_1", "type": "Dense (Sigmoid)", "output_shape": "(None, 1)", "params": 65},
+    ]
 
     return ModelInfoResponse(
-        model_type="Sequential LSTM",
-        total_params=model.count_params(),
-        trainable_params=sum(
-            tf.keras.backend.count_params(w) for w in model.trainable_weights
-        ),
+        model_type="Sequential Bidirectional LSTM",
+        total_params=6521601,
+        trainable_params=6521601,
         layers=layers,
         input_shape="(None, 300)",
         max_sequence_length=MAX_LEN,
@@ -169,6 +193,6 @@ async def dataset_stats():
 async def health():
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
+        "model_loaded": interpreter is not None,
         "tokenizer_loaded": tokenizer is not None,
     }
